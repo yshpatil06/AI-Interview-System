@@ -1,0 +1,5 @@
+{
+  "/interview/[sessionId]/live/page": "app/interview/[sessionId]/live/page.js",
+  "/page": "app/page.js",
+  "/interview/[sessionId]/hardware-check/page": "app/interview/[sessionId]/hardware-check/page.js"
+}
