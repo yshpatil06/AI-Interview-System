@@ -8,17 +8,18 @@
     "/layout": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
+      "static/css/app/layout.css",
       "static/chunks/app/layout.js"
     ],
-    "/interview/[sessionId]/hardware-check/page": [
+    "/start/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
-      "static/chunks/app/interview/[sessionId]/hardware-check/page.js"
+      "static/chunks/app/start/page.js"
     ],
-    "/interview/[sessionId]/live/page": [
+    "/recruiter/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
-      "static/chunks/app/interview/[sessionId]/live/page.js"
+      "static/chunks/app/recruiter/page.js"
     ]
   }
 }

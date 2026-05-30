@@ -1,10 +1,27 @@
-export const metadata = { title: 'InterviewAI', description: 'AI Video Interview Platform' };
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "Nexus Interview — AI Video Screening",
+  description:
+    "Automated AI video interviews with streaming capture, proctoring, and recruiter dashboards.",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html lang="en">
-      <body style={{ margin: 0, padding: 0, background: '#000', color: '#fff', fontFamily: 'Inter, sans-serif' }}>
-        {children}
-      </body>
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+          rel="stylesheet"
+        />
+      </head>
+      <body>{children}</body>
     </html>
   );
 }

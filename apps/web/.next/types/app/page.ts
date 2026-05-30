@@ -1,4 +1,4 @@
-// File: /Users/yashmahendrapatil/Downloads/interview-ai 2/apps/web/app/page.tsx
+// File: /Users/yashmahendrapatil/Documents/Projects/ai-interview/apps/web/app/page.tsx
 import * as entry from '../../../app/page.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 

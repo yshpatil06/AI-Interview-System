@@ -1,240 +1,393 @@
-# InterviewAI — AI Video Interview Platform
+# Nexus Interview — AI Video Interview System
 
-> Automated first-round candidate screening via an AI interviewer that verbally asks questions and captures responses via real-time video/audio streaming.
+> **Live demo:** _Deploy and add your URL here_  
+> **Walkthrough video:** _Add link after recording_  
+> **Submission date:** May 30, 2026
+
+Automated first-round video screening: an AI interviewer asks questions, candidates respond on camera, media streams in real time, and recruiters review transcripts, playback, and proctoring signals in one dashboard.
+
+---
+
+## Table of Contents
+
+1. [Problem Understanding](#1-problem-understanding)
+2. [Architecture Overview](#2-architecture-overview)
+3. [Technical Decisions & Tradeoffs](#3-technical-decisions--tradeoffs)
+4. [Failure Scenarios & Edge Cases](#4-failure-scenarios--edge-cases)
+5. [Recovery Mechanisms](#5-recovery-mechanisms)
+6. [Product Thinking](#6-product-thinking)
+7. [Scalability Considerations](#7-scalability-considerations)
+8. [Observability & Debugging](#8-observability--debugging)
+9. [AI Usage Documentation](#9-ai-usage-documentation)
+10. [Demo & Walkthrough](#10-demo--walkthrough)
+11. [Setup Instructions](#setup-instructions)
 
 ---
 
 ## 1. Problem Understanding
 
-Manual first-round interviews don't scale. Recruiters spend hours on repetitive screening calls that could be automated — while candidates have no flexible scheduling. InterviewAI solves this by:
+### What problem are you solving?
 
-- **Automating screening**: AI (GPT-4o + TTS) verbally asks role-specific questions
-- **Capturing responses**: Real-time video/audio streaming with chunk-based resilience
-- **Evaluating automatically**: Deepgram transcription → GPT-4o scoring → unified recruiter dashboard
-- **Maintaining integrity**: Real-time proctoring (tab-switch detection, face absence monitoring)
+Manual first-round interviews do not scale. Recruiters spend hours on repetitive screens while strong candidates wait in queue. Video async tools often fail on poor networks or lose entire recordings when a session drops.
+
+### Why is this system needed?
+
+Recruiters need **high-fidelity, reviewable** evidence of communication and technical thinking for hundreds of candidates **asynchronously**. Candidates need a **fair, low-friction** experience that survives disconnects and does not require installing desktop software.
+
+**Nexus Interview** automates:
+
+- Question delivery (browser TTS today; swappable for ElevenLabs/Deepgram TTS)
+- **Streaming** capture of answers via `MediaRecorder` chunks
+- **Durable storage** and merge for playback
+- **Speech-to-text** (Deepgram when configured)
+- **Integrity signals** (tab switch, blur, face-absence heuristic)
 
 ---
 
 ## 2. Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    FRONTEND (Next.js 14)                     │
-│  HardwareCheck → LiveInterview → Complete                    │
-│  MediaRecorder API (5s chunks) → POST /api/chunk/upload      │
-│  Socket.io /interview (proctoring, state sync)               │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ REST + WebSocket
-┌──────────────────────▼──────────────────────────────────────┐
-│                   BACKEND (Express + Node.js)                │
-│  Routes: /interview, /chunk, /recruiter                      │
-│  Socket.io: /interview namespace, /recruiter namespace       │
-│  MongoDB (Mongoose): AiInterview, Candidate, Chunk           │
-│  Redis: session cache, rate limiting                         │
-└──────────┬─────────────────────────┬────────────────────────┘
-           │ S3 PutObject             │ SQS SendMessage
-┌──────────▼──────┐        ┌─────────▼────────────────────────┐
-│  AWS S3 / R2    │        │  SQS FIFO Queues                  │
-│  chunk_000.webm │        │  AUDIO_MERGE → TRANSCRIPTION      │
-│  chunk_001.webm │        │  → EVALUATION → DLQ               │
-│  merged.webm    │        └─────────┬────────────────────────┘
-│  tts/q_xxx.mp3  │                  │ Lambda Workers
-└─────────────────┘        ┌─────────▼────────────────────────┐
-                            │  Worker 1: FFmpeg Merge           │
-                            │  Worker 2: Deepgram Transcribe    │
-                            │  Worker 3: GPT-4o Evaluate        │
-                            └──────────────────────────────────┘
-```
-
-### Media Flow
+### High-level system architecture
 
 ```
-Frontend
-  └─ MediaRecorder (timeslice: 5000ms)
-       └─ ondataavailable → blob (>1KB)
-            └─ POST /api/chunk/upload (FormData)
-                 └─ S3: interviews/{id}/{qId}/chunk_000.webm
-                      └─ SQS: AUDIO_MERGE_QUEUE
-                           └─ FFmpeg concat → merged.webm
-                                └─ SQS: TRANSCRIPTION_QUEUE
-                                     └─ Deepgram Nova-2 → transcript
-                                          └─ SQS: EVALUATION_QUEUE
-                                               └─ GPT-4o → score + feedback
-                                                    └─ Socket emit → recruiter
+┌─────────────────┐     WebSocket + REST      ┌──────────────────┐
+│  Next.js Web    │ ◄──────────────────────► │  Express API     │
+│  (React 3D UI)  │   chunks, proctoring      │  + ws server     │
+└────────┬────────┘                           └────────┬─────────┘
+         │ MediaRecorder                              │ write
+         ▼ chunks                                     ▼
+┌─────────────────┐                           ┌──────────────────┐
+│  Browser A/V    │                           │  Disk / S3 / R2  │
+│  Hardware check │                           │  chunk_NNN.webm  │
+└─────────────────┘                           └────────┬─────────┘
+                                                       │
+                                                       ▼
+                                              ┌──────────────────┐
+                                              │  Merge queue     │
+                                              │  (→ FFmpeg prod) │
+                                              └────────┬─────────┘
+                                                       ▼
+                                              ┌──────────────────┐
+                                              │  Deepgram STT    │
+                                              └────────┬─────────┘
+                                                       ▼
+                                              ┌──────────────────┐
+                                              │  Recruiter UI    │
+                                              └──────────────────┘
 ```
 
-### WebSocket Event Flow
+| Layer | Technology |
+|--------|------------|
+| Frontend | Next.js 14, React Three Fiber, Framer Motion |
+| API | Express, `ws`, Pino logging |
+| Shared types | `@ai-interview/shared` |
+| Storage (demo) | `data/sessions/{id}/chunks/` |
+| Storage (prod path) | S3 / Cloudflare R2 |
+| Transcription | Deepgram API (optional) |
 
-```
-Candidate                    Server                    Recruiter
-    │── join_session ────────►│                            │
-    │◄── session_state ───────│                            │
-    │── recording_started ───►│                            │
-    │── proctor_event ────────►│──── proctor_alert ───────►│
-    │── recording_stopped ───►│                            │
-    │                         │──── finalize_queued ──────►│
-    │◄── next_question ───────│                            │
-    │── next_question (last) ─►│                           │
-    │◄── interview_complete ──│                            │
-```
+### Media flow (frontend → backend → storage → transcription)
+
+1. **Frontend** — `MediaRecorder` emits `Blob` every **2.5s** (`CHUNK_MS`).
+2. **Streaming** — Each blob is base64-encoded and sent over **WebSocket** (`type: "chunk"`) with `questionId` + monotonic `sequence`.
+3. **Storage** — Server writes `chunk_000042.webm` under `sessions/{id}/chunks/{questionId}/`. Duplicates and sub-100-byte chunks are rejected.
+4. **Processing** — On question/interview complete, **merge queue** concatenates valid chunks into `merged/{questionId}.webm`.
+5. **Transcription** — Merged buffer POSTed to Deepgram when `DEEPGRAM_API_KEY` is set; otherwise demo placeholder text.
+
+### WebSocket / event flow
+
+| Client → Server | Purpose |
+|-----------------|--------|
+| `auth` | Bind socket to `sessionId` + `resumeToken` |
+| `chunk` | Stream media segment |
+| `chunk_ack_request` | Ask for missing sequences after reconnect |
+| `proctor` | Tab switch, face absent, blur, copy |
+| `question_complete` | Advance question index |
+| `heartbeat` | Keep-alive |
+
+| Server → Client | Purpose |
+|-----------------|--------|
+| `auth_ok` + `missingChunks` | Resume state after reconnect |
+| `chunk_ack` | Confirm write (note `duplicate`) |
+| `missing_chunks` | List sequences to re-send |
+| `question_advanced` | UI moves to next question |
+| `interview_complete` | Trigger final merge + scoring |
+
+**REST fallback:** `POST /api/interviews/:id/chunk` for environments that block WebSockets.
 
 ---
 
 ## 3. Technical Decisions & Tradeoffs
 
-### Streaming over Full Upload
-Chunks are uploaded every 5 seconds via `MediaRecorder(timeslice: 5000)`. If the session disconnects at 90%, we already have 90% of the recording. A full upload at the end risks losing everything on network failure.
+### Why streaming over full upload?
 
-### Chunk-Based Deterministic Keys
-S3 keys follow `chunk_000.webm`, `chunk_001.webm` — padded 3-digit index. FFmpeg's concat demuxer re-orders them correctly even if they arrive out of sequence.
+- **Resilience:** If the network drops at minute 9 of 10, chunks 0–N are already on disk.
+- **Memory:** Avoids holding a 200MB+ blob in RAM before upload.
+- **Latency:** Recruiters can begin processing earlier; merge runs async.
 
-### Async Processing via SQS
-Heavy tasks (FFmpeg, Deepgram, GPT-4o) are decoupled from the API. The main server stays responsive (<200ms response times) while workers scale horizontally.
+**Tradeoff:** More server complexity (ordering, dedup, merge). Mitigated with deterministic filenames and sequence numbers.
 
-### IndexedDB for Failed Chunks
-Failed chunk uploads are persisted in IndexedDB with key `pending_chunk_{interviewId}_{questionId}_{index}`. On reconnect, the hook drains the queue before resuming normal recording.
+### Why this architecture (Express + WS + Next)?
 
----
+- **Separation:** Long-lived WebSocket connections stay on a dedicated Node process; Next.js focuses on UI and SSR.
+- **Upgrade path:** Chunk paths and queue names mirror production (`AUDIO_MERGE_QUEUE`, Lambda workers) without over-building the demo.
+- **Shared types:** One package prevents client/server drift on `session_data`.
 
-## 4. Failure Scenarios & Recovery
+### Why disk storage in the demo?
 
-| Scenario | Detection | Recovery |
-|---|---|---|
-| Network interruption | Fetch error in `uploadChunkWithRetry` | Exponential backoff (1s → 2s → 4s), save to IndexedDB |
-| Duplicate chunks | `HeadObject` check before upload | Skip if S3 key already exists |
-| Camera/mic disconnect | `track.onended` event | Show overlay, emit proctor event, allow retry |
-| Partial upload failure | All retries exhausted | IDB persistence, drain on reconnect |
-| WebSocket disconnect | `socket.on('disconnect')` | Auto-reconnect with backoff, re-emit `join_session` |
-| Empty/corrupted chunks | `blob.size > 1000` + WAV/WebM header check | Skip upload, log warning, continue |
-| Session refresh | `GET /api/interview/:id` | Resume from `session_data.currentQuestionIndex` |
-| Worker failure | SQS visibility timeout + retry | Up to 3 retries → DLQ → CloudWatch alert |
+Zero cloud credentials for evaluators. Production swaps `chunkHandler` write target for S3/R2 presigned URLs.
+
+### Why browser TTS for the “AI interviewer”?
+
+Instant demo without API keys. Replace with Deepgram/ElevenLabs for production voice quality.
 
 ---
 
-## 5. Product Thinking
+## 4. Failure Scenarios & Edge Cases
 
-### Candidate Experience
-- **Hardware Check page** validates camera, mic, speakers, and network before the interview starts — reducing mid-interview failures
-- **AI speaks first** via pre-generated TTS audio, creating a natural conversational feel
-- **Progress dots** show question number so candidates know where they are
-- **Session resume** — if the page refreshes, the interview continues from exactly where it left off
-
-### Recruiter Experience
-- **Unified drill-down**: resume + video playback + transcript + AI scores in one view
-- **Real-time proctoring feed** via Socket.io — see tab switches and face absences live
-- **Suspicion score** (0–100) auto-calculated from proctoring events
-- **Recommendation badges** (Strong Yes / Yes / Maybe / No) for fast triage
-
-### Suspicious Activity Tracking
-- Tab switches increment `proctoring.tabSwitchCount` via `visibilitychange` API
-- Face absence detected via canvas pixel analysis every 3 seconds
-- `suspiciousScore` = `(tabSwitches × 15) + (faceAbsences × 10) + (flags × 5)`, capped at 100
-- All events timestamped and stored for recruiter timeline view
+| Scenario | Risk | Mitigation in codebase |
+|----------|------|------------------------|
+| **Network interruptions** | WS drops mid-chunk | Exponential backoff reconnect; chunk queue on client; `auth_ok.missingChunks` |
+| **Duplicate chunks** | Double write / storage bloat | `receivedChunkSequences` dedup; `chunk_ack.duplicate` |
+| **Camera/mic disconnect** | `MediaRecorder` error | `track ended` listener → proctor event + UI flag |
+| **Partial upload failures** | Disk write error | `saveChunk` returns `write_failed`; client can retry same sequence |
+| **WebSocket reconnects** | Stale auth | Re-`auth` on every `onopen`; flush outbound queue |
+| **Empty/corrupted chunks** | FFmpeg/merge break | `CHUNK_MIN_BYTES` (100) rejection; merge skips tiny buffers |
 
 ---
 
-## 6. Scalability Considerations
+## 5. Recovery Mechanisms
 
-| Bottleneck | Current | At Scale |
-|---|---|---|
-| Video chunk ingestion | Express + S3 | S3 Transfer Acceleration, CloudFront |
-| Transcription queue | Lambda workers | Auto-scaling Lambda concurrency |
-| WebSocket connections | Single EC2 | Socket.io with Redis adapter + multiple nodes |
-| DB reads (recruiter list) | MongoDB | Add indexes + Redis cache for paginated results |
-| TTS pre-generation | Synchronous on create | Pre-generate in background job |
+### Reconnects
 
----
+`InterviewSocket` reconnects up to 8 times with exponential backoff (max 15s). On `auth_ok`, server returns **missing chunk indices**; client calls `chunk_ack_request` to reconcile.
 
-## 7. Observability & Debugging
+### Retry / recovery logic
 
-- **CloudWatch** structured logs on every pipeline step: `[MergeWorker]`, `[TranscribeWorker]`, `[EvaluateWorker]`
-- **DLQ monitoring**: CloudWatch alarm fires when DLQ message count > 0
-- **processingStatus field** on each response: `pending → merging → transcribing → evaluating → done | failed`
-- **reconnectCount** in `session_data` tracks unstable connections
-- **Socket disconnect reason** logged with timestamp in `proctoring.flags`
+- Outbound WS messages **queued** until socket is open.
+- HTTP `POST .../chunk` available as alternate transport.
+- Session brain: `AiInterview.session_data` persisted to `data/sessions/{id}.json` on every chunk.
 
----
+### Chunk recovery strategy
 
-## 8. AI Usage Documentation
+- Filenames: `chunk_{sequence.padStart(6,'0')}.webm` — sortable regardless of arrival order.
+- `getMissingSequences()` scans disk vs expected range.
+- Duplicates: idempotent ack without double-counting.
 
-| What | How AI Was Used | Human Decision |
-|---|---|---|
-| SQS queue architecture | AI suggested FIFO queues with deduplication IDs | Chose 3-queue pipeline (merge → transcribe → evaluate) |
-| FFmpeg concat approach | AI provided concat demuxer command | Validated against FFmpeg docs, added error handling |
-| Chunk recovery strategy | AI suggested IndexedDB for failed chunks | Added IDB key naming convention and drain-on-reconnect logic |
-| GPT-4o evaluation prompt | AI drafted initial prompt | Refined scoring rubric, added JSON response_format |
-| Face detection heuristic | AI suggested skin-tone pixel approach | Chose 3% threshold after testing |
-| Socket.io reconnect config | AI provided config params | Set Infinity reconnection attempts for interview reliability |
+### Failure handling approach
 
-**Prompting approach**: "Understand → Explore → Decide" — first understood the constraint (streaming resilience), explored options (WebRTC, chunked HTTP, WebSocket binary), then decided based on browser compatibility and retry semantics.
+- Per-chunk: fail fast with reason (`chunk_too_small`, `invalid_base64`).
+- Per-question merge: `mergeStatus: failed` if zero valid chunks.
+- Interview: `status: failed | completed` with `aiSummary` for recruiter review.
 
 ---
 
-## 9. Setup Instructions
+## 6. Product Thinking
+
+### Recruiter experience
+
+- **Single dashboard:** candidate info, score, summary, per-question transcript + `<video>` playback, proctoring timeline.
+- **Drill-down:** select any session from list; flags surfaced before watching full video.
+
+### Candidate experience
+
+- **Hardware check** gate reduces “I can’t hear you” support load.
+- **Black/gray 3D brand** — focused, professional, not playful.
+- **Visible WS status** — transparency when reconnecting.
+- **Resume URL** — `?token=` + `session_data.resumeToken` (shareable secure link pattern).
+
+### Suspicious activity tracking
+
+| Event | Detection |
+|-------|-----------|
+| `tab_switch` | `document.visibilitychange` |
+| `window_blur` | `window.blur` |
+| `copy_paste` | `copy` event |
+| `face_absent` | Canvas brightness heuristic + camera track ended |
+
+Stored in `session_data.suspiciousEvents[]` with timestamp; reflected in AI score penalty.
+
+### UX decisions
+
+- AI speaks question before “Start answer” (reduces talking over the prompt).
+- 2.5s chunks balance overhead vs recovery granularity.
+- Post-interview confirmation screen sets expectations on processing time.
+
+---
+
+## 7. Scalability Considerations
+
+### What may break at scale
+
+- **Single-node disk I/O** — thousands of concurrent chunk writes.
+- **In-process merge queue** — CPU-bound; one worker.
+- **JSON session files** — not ideal for concurrent updates (use Postgres + row locks).
+- **WebSocket fan-out** — sticky sessions required behind load balancers.
+
+### Performance bottlenecks
+
+- Base64 over WS (~33% overhead) — production: binary frames or S3 multipart.
+- Merge via `Buffer.concat` — production: FFmpeg stream merge.
+- Recruiter list loads all interviews — paginate + index by status.
+
+### Future improvements for high concurrency
+
+- S3/R2 presigned **direct upload** from browser.
+- **SQS** `TRANSCRIPTION_QUEUE` + Lambda FFmpeg workers.
+- **Redis** for session locks and chunk bitmaps.
+- **CDN** for merged playback.
+- Horizontal **API** replicas with Redis pub/sub for WS.
+
+---
+
+## 8. Observability & Debugging
+
+### Logging strategy
+
+- **Pino** structured logs on server (`chunk saved`, `proctor event`, `merge complete`, `WS reconnect`).
+- `LOG_LEVEL=debug` for chunk-level traces in development.
+
+### Error tracking
+
+- Failed chunks log `write_failed` with path.
+- Deepgram failures fall back to demo transcript with `logger.warn`.
+- Client surfaces recorder errors and proctor flags in-sidebar.
+
+### Debugging production failures
+
+1. Find `sessionId` in recruiter dashboard.
+2. Inspect `data/sessions/{id}.json` for `receivedChunkSequences` vs `suspiciousEvents`.
+3. List `chunks/{questionId}/` — gaps in `chunk_*` numbering explain playback issues.
+4. Check merged file size under `merged/`.
+5. Correlate timestamps in logs with proctor events.
+
+---
+
+## 9. AI Usage Documentation
+
+### How AI tools were used
+
+| Area | AI assistance | Human decision |
+|------|---------------|----------------|
+| Monorepo scaffolding | Suggested workspace layout | Approved Express+WS split vs all-in-Next |
+| WebSocket contract | Draft message types | Reviewed for idempotency + resume |
+| 3D hero scene | R3F component patterns | Chose black/gray palette + icosahedron |
+| README structure | Mapped to rubric sections | Filled with actual implementation details |
+| Scoring heuristic | Brainstorm factors | Implemented simple penalty/bonus formula |
+
+### Prompt / thought process
+
+1. **Understand** — “What must survive a 30s network drop?”
+2. **Explore** — Compared full upload vs 1s vs 2.5s chunks.
+3. **Decide** — Streaming + deterministic keys + merge queue.
+
+Example prompts used during build:
+
+- “Design WebSocket messages for chunk ack and reconnect with missing sequence list.”
+- “List failure modes for MediaRecorder chunk pipelines and mitigations.”
+
+### Yours vs AI-assisted
+
+- **Yours:** Product flows (hardware check → room → dashboard), proctoring event taxonomy, theme, chunk size, score formula.
+- **AI-assisted:** Boilerplate, type definitions, documentation phrasing, Three.js starter mesh.
+
+All evaluation/scoring logic was kept intentionally simple and **manually reviewed** — not auto-trusted for hiring decisions.
+
+---
+
+## 10. Demo & Walkthrough
+
+### Setup instructions
+
+See [Setup Instructions](#setup-instructions) below.
+
+### Demo video
+
+_Record a 5–10 min walkthrough covering:_
+
+1. Landing 3D experience  
+2. Candidate flow + chunk streaming  
+3. Simulated disconnect (toggle offline) + reconnect  
+4. Recruiter dashboard review  
+5. How you used AI in your workflow  
+
+**Place link here:** `TODO: https://...`
+
+### Live link
+
+**Place deployed URL here:** `TODO: https://your-app.vercel.app`
+
+Recommended deploy:
+
+- **Web:** Vercel (`apps/web`, set `NEXT_PUBLIC_*` env vars)  
+- **API:** Railway / Render (`apps/server`, mount volume for `data/`)
+
+---
+
+## Setup Instructions
 
 ### Prerequisites
-- Node.js 20+, Docker, FFmpeg installed locally
 
-### 1. Clone & Install
+- Node.js 20+
+- npm 10+
+- Microphone + camera (for live demo)
+
+### Install
+
 ```bash
-git clone <repo>
-cd interview-ai
-npm install   # installs all workspaces
+git clone <your-repo>
+cd ai-interview
+cp .env.example .env
+npm install
+npm run build -w @ai-interview/shared
 ```
 
-### 2. Start Infrastructure
+### Run locally
+
 ```bash
-docker-compose up -d
-# MongoDB: localhost:27017
-# Redis: localhost:6379
-# LocalStack (S3/SQS): localhost:4566
+# Terminal 1 — API + WebSocket on :4000
+npm run dev -w @ai-interview/server
+
+# Terminal 2 — Web on :3000
+npm run dev -w @ai-interview/web
 ```
 
-### 3. Environment Setup
+Or both:
+
 ```bash
-cp apps/server/.env.example apps/server/.env
-cp apps/web/.env.example apps/web/.env.local
-# Fill in your API keys
+npm run dev
 ```
 
-### 4. Create LocalStack S3 bucket + SQS queues (dev)
-```bash
-aws --endpoint-url=http://localhost:4566 s3 mb s3://interview-ai-media --region ap-south-1
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name interview-merge.fifo --attributes FifoQueue=true,ContentBasedDeduplication=true
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name interview-transcribe.fifo --attributes FifoQueue=true,ContentBasedDeduplication=true
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name interview-evaluate.fifo --attributes FifoQueue=true,ContentBasedDeduplication=true
+### Environment
+
+| Variable | Description |
+|----------|-------------|
+| `PORT` | API port (default 4000) |
+| `PUBLIC_WEB_URL` | CORS + join links |
+| `DEEPGRAM_API_KEY` | Optional real STT |
+| `NEXT_PUBLIC_API_URL` | Browser REST base |
+| `NEXT_PUBLIC_WS_URL` | Browser WS base |
+
+### Quick test flow
+
+1. Open http://localhost:3000  
+2. **Begin as Candidate** → fill form → hardware check → interview room  
+3. Answer 3 questions (Start answer → Finish answer)  
+4. Open http://localhost:3000/recruiter → select session → watch playback  
+
+### Project structure
+
 ```
-
-### 5. Run Dev Servers
-```bash
-# Terminal 1 — Backend
-cd apps/server && npm run dev
-
-# Terminal 2 — Frontend
-cd apps/web && npm run dev
+ai-interview/
+├── apps/
+│   ├── server/          # Express + WebSocket + merge queue
+│   └── web/             # Next.js UI + 3D landing
+├── packages/shared/     # Types + DEFAULT_QUESTIONS
+├── data/sessions/       # Runtime session storage (gitignored)
+├── staticfiles/         # Planning docs
+└── README.md
 ```
-
-### 6. Open
-- Candidate: `http://localhost:3000/interview/{sessionId}/hardware-check`
-- Recruiter: `http://localhost:3000/dashboard/recruiter`
 
 ---
 
-## 10. Project Structure
+## License
 
-```
-interview-ai/
-├── apps/
-│   ├── web/                    # Next.js 14 frontend
-│   │   ├── app/interview/      # Hardware check, Live, Complete pages
-│   │   ├── hooks/              # useMediaRecorder, useWebSocket, useProctoring
-│   │   └── components/         # VideoRecorder, AIAvatar, TimerBar
-│   └── server/                 # Express backend
-│       ├── src/routes/         # interview.routes.ts
-│       ├── src/models/         # AiInterview, Candidate, Chunk
-│       ├── src/services/       # chunk.service.ts
-│       ├── src/workers/        # merge-worker, transcribe-worker
-│       └── src/socket/         # interview.socket.ts
-└── packages/
-    └── shared-types/           # Shared TypeScript interfaces
-```
+MIT — for evaluation and portfolio use.

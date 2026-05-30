@@ -1,0 +1,16 @@
+{
+  "name": "ai-interview",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c gray,cyan \"npm run dev -w @ai-interview/server\" \"npm run dev -w @ai-interview/web\"",
+    "build": "npm run build -w @ai-interview/web && npm run build -w @ai-interview/server",
+    "start": "concurrently -n server,web \"npm run start -w @ai-interview/server\" \"npm run start -w @ai-interview/web\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
